@@ -38,7 +38,61 @@ Gợi ý
 from ..common import WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
 from ..model_cache import get_preds  # noqa: F401
 
+CHECK = "second_opinion"
+
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    c = cfg["second_opinion"]
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+    issues = []
+
+    for path in ds.image_files():
+        stem = path.stem
+        rows = preds.get(stem)
+        label_lines = ds.read_label_lines(stem)
+        size = ds.image_size(stem)
+        if rows is None or label_lines is None or size is None:
+            continue                                   # không có dự đoán / không có file nhãn / ảnh hỏng: bỏ qua
+        width, height = size
+        labels = ds.valid_boxes(stem)                  # [(id lớp, cx, cy, w, h)]
+
+        # P: dự đoán đủ tin cậy VÀ đủ lớn
+        confident = [r for r in rows if r[1] >= c["conf"] and (r[4] * width) * (r[5] * height) >= c["min_area_px"]]
+        for cls, conf, *box in confident:
+            cands = [(iou_xywh(box, lb[1:]), lb[0]) for lb in labels]
+            cands = [(iou, lcls) for iou, lcls in cands if iou >= c["iou_missing"]]
+            if not cands:
+                issues.append(Issue(CHECK, WARN, "POSSIBLE_MISSING", stem,
+                                    f"model thấy lớp {cls} (conf {conf:.2f}) mà nhãn không có box nào khớp", extra={"conf": conf}))
+                continue
+            same = [iou for iou, lcls in cands if lcls == cls]
+            if same:
+                best = max(same)
+                if best < c["iou_loose"]:
+                    issues.append(Issue(CHECK, WARN, "POSSIBLE_LOOSE_BOX", stem,
+                                        f"box lớp {cls} khớp model chỉ IoU {best:.2f} (lỏng/lệch)", extra={"conf": conf, "iou": best}))
+                continue                               # có nhãn cùng lớp phủ vật này: không cờ
+            best = max(iou for iou, _ in cands)        # chỉ còn nhãn khác lớp
+            if best >= c["iou_match"]:
+                issues.append(Issue(CHECK, WARN, "POSSIBLE_WRONG_CLASS", stem,
+                                    f"model nói lớp {cls} (conf {conf:.2f}) nhưng nhãn gán lớp khác (IoU {best:.2f})",
+                                    extra={"conf": conf, "iou": best}))
+            # IoU trong [iou_missing, iou_match): mơ hồ, không cờ
+
+        # FALSE_POS: dòng nhãn không khớp dự đoán nào (dùng fp_conf, không lọc diện tích)
+        fp_boxes = [r[2:6] for r in rows if r[1] >= c["fp_conf"]]
+        for line_no, text in label_lines:              # số dòng gốc, kể cả khi có dòng trống/hỏng
+            try:
+                lcls, *lbox = parse_yolo_line(text)
+            except ValueError:
+                continue
+            if not 0 <= lcls < len(ds.classes):
+                continue
+            best = max((iou_xywh(lbox, b) for b in fp_boxes), default=0.0)
+            if best < c["iou_missing"]:
+                issues.append(Issue(CHECK, WARN, "POSSIBLE_FALSE_POS", stem,
+                                    f"box nhãn lớp {lcls} không khớp vật nào model thấy (IoU lớn nhất {best:.2f})",
+                                    line=line_no, extra={"iou": best}))
+
+    return issues
